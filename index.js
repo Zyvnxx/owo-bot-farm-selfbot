@@ -1,177 +1,328 @@
-import { Client } from "discord.js-selfbot-v13";
-import readline from "readline";
-import chalk from "chalk";
-import dotenv from "dotenv";
-import player from "play-sound";
-import { spawn } from "child_process";
+import { Client } from 'discord.js-selfbot-v13';
+import fs from 'fs';
+import readline from 'readline';
+import dotenv from 'dotenv';
+import { fileURLToPath } from 'url';
+import { dirname } from 'path';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = dirname(__filename);
 
 dotenv.config();
 
-const args = process.argv.slice(2);
-const client = new Client();
-let playSound = args.includes("--sound=true");
+// ==================== KONFIGURASI ====================
+const enableSound = process.argv.includes('--sound=true');
+const DAILY_COOLDOWN = 24 * 60 * 60 * 1000; // 24 jam
 
-// Global Variables
-const gemItems = [];
-let spam = false;
-let activeChannel = null;
+// Warna untuk console output
+const colors = {
+    reset: '\x1b[0m', bright: '\x1b[1m', dim: '\x1b[2m',
+    red: '\x1b[31m', green: '\x1b[32m', yellow: '\x1b[33m',
+    blue: '\x1b[34m', magenta: '\x1b[35m', cyan: '\x1b[36m'
+};
 
-const gemTypeNames = { gem1: "Hunting Gem", gem3: "Empowering Gem", gem4: "Lucky Gem" };
-const gemRarityNames = { c: "Common", u: "Uncommon", r: "Rare", e: "Epic", l: "Legendary", f: "Fable" };
+// ==================== CLASS BOT PER TOKEN ====================
+class OwOBotInstance {
+    constructor(token, index) {
+        this.token = token;
+        this.index = index;
+        this.client = new Client({ checkUpdate: false });
+        this.isFarming = false;
+        this.farmChannel = null;
+        this.captchaDetected = false;
+        this.lastHuntTime = 0;
+        this.lastBattleTime = 0;
+        this.lastDailyTime = 0;
+        this.dailyTimeout = null;
+        this.currentCommandIndex = 0;
+        this.farmSequence = ['owo hunt', 'owo battle'];
+    }
 
+    log(message, type = 'info') {
+        const timestamp = new Date().toLocaleTimeString();
+        const prefixMap = {
+            success: `${colors.green}[✓]${colors.reset}`,
+            error: `${colors.red}[✗]${colors.reset}`,
+            warning: `${colors.yellow}[!]${colors.reset}`,
+            info: `${colors.blue}[i]${colors.reset}`,
+            farm: `${colors.magenta}[🌾]${colors.reset}`,
+            daily: `${colors.cyan}[📅]${colors.reset}`
+        };
+        const prefix = prefixMap[type] || `${colors.cyan}[*]${colors.reset}`;
+        console.log(`${colors.dim}[${timestamp}]${colors.reset} ${colors.bright}[Akun ${this.index}]${colors.reset} ${prefix} ${message}`);
+    }
+
+    formatTimeRemaining(ms) {
+        const hours = Math.floor(ms / (60 * 60 * 1000));
+        const minutes = Math.floor((ms % (60 * 60 * 1000)) / (60 * 1000));
+        const seconds = Math.floor((ms % (60 * 1000)) / 1000);
+        return `${hours}j ${minutes}m ${seconds}d`;
+    }
+
+    async claimDaily() {
+        if (!this.farmChannel) {
+            this.log('Channel belum diset, skip daily', 'warning');
+            this.scheduleNextDaily();
+            return;
+        }
+        try {
+            this.log('Mengklaim daily reward...', 'daily');
+            await this.farmChannel.send('owo daily');
+            this.lastDailyTime = Date.now();
+            this.scheduleNextDaily();
+        } catch (error) {
+            this.log(`Error claim daily: ${error.message}`, 'error');
+            this.scheduleNextDaily();
+        }
+    }
+
+    scheduleNextDaily() {
+        if (this.dailyTimeout) clearTimeout(this.dailyTimeout);
+        const now = Date.now();
+        let nextDailyTime = this.lastDailyTime === 0 ? now : this.lastDailyTime + DAILY_COOLDOWN;
+        const timeUntilNext = nextDailyTime - now;
+        
+        if (timeUntilNext <= 0) {
+            this.log('Waktunya claim daily!', 'daily');
+            this.claimDaily();
+        } else {
+            this.log(`Daily berikutnya dalam: ${this.formatTimeRemaining(timeUntilNext)}`, 'daily');
+            this.dailyTimeout = setTimeout(() => this.claimDaily(), timeUntilNext);
+        }
+    }
+
+    async sendNextCommand() {
+        if (!this.isFarming || !this.farmChannel || this.captchaDetected) return;
+        
+        const now = Date.now();
+        const command = this.farmSequence[this.currentCommandIndex];
+        
+        if (command === 'owo hunt' && (now - this.lastHuntTime) < 30000) {
+            setTimeout(() => this.sendNextCommand(), 5000);
+            return;
+        }
+        if (command === 'owo battle' && (now - this.lastBattleTime) < 30000) {
+            setTimeout(() => this.sendNextCommand(), 5000);
+            return;
+        }
+        
+        try {
+            await this.farmChannel.send(command);
+            this.log(`Sent: ${command}`, 'farm');
+            
+            if (command === 'owo hunt') this.lastHuntTime = now;
+            if (command === 'owo battle') this.lastBattleTime = now;
+            
+            this.currentCommandIndex = (this.currentCommandIndex + 1) % this.farmSequence.length;
+            setTimeout(() => this.sendNextCommand(), Math.random() * 10000 + 5000);
+        } catch (error) {
+            this.log(`Error: ${error.message}`, 'error');
+            setTimeout(() => this.sendNextCommand(), 10000);
+        }
+    }
+
+    playSound() {
+        if (enableSound) process.stdout.write('\x07');
+    }
+
+    setupEventHandlers() {
+        this.client.on('messageCreate', async (message) => {
+            // Deteksi captcha
+            if (message.author.id !== this.client.user.id) {
+                const content = message.content.toLowerCase();
+                if (content.includes('captcha') || content.includes('verification') || content.includes('human verification')) {
+                    this.log('⚠️ CAPTCHA DETECTED! Stopping farm...', 'warning');
+                    this.captchaDetected = true;
+                    this.isFarming = false;
+                    this.playSound();
+                    if (this.farmChannel) {
+                        await this.farmChannel.send('⚠️ Captcha detected! Please verify manually.');
+                    }
+                    return;
+                }
+                
+                // Deteksi reward
+                if (content.includes('you received') || content.includes('you found') || content.includes('you defeated')) {
+                    this.log(`Reward: ${message.content.substring(0, 80)}`, 'success');
+                }
+                
+                // Deteksi daily response
+                if (content.includes('daily')) {
+                    if (content.includes('already')) {
+                        this.log('Daily sudah diklaim hari ini', 'daily');
+                        this.lastDailyTime = Date.now();
+                        this.scheduleNextDaily();
+                    } else if (content.includes('claimed') || content.includes('received')) {
+                        this.log('Daily reward claimed!', 'success');
+                    }
+                }
+            }
+            
+            // Perintah in-chat
+            if (message.author.id === this.client.user.id) {
+                if (message.content === 'owo hh') {
+                    this.farmChannel = message.channel;
+                    this.isFarming = true;
+                    this.captchaDetected = false;
+                    this.log(`Farming started in #${message.channel.name}`, 'success');
+                    if (this.lastDailyTime === 0 && !this.dailyTimeout) this.scheduleNextDaily();
+                    setTimeout(() => this.sendNextCommand(), 5000);
+                    await message.edit('✅ Auto-farming started!');
+                }
+                
+                if (message.content === 'owo bb') {
+                    this.isFarming = false;
+                    this.log('Farming stopped', 'warning');
+                    await message.edit('⏹️ Auto-farming stopped!');
+                }
+                
+                if (message.content === 'owo stats') {
+                    await message.edit(this.getStatsMessage());
+                }
+            }
+        });
+    }
+
+    getStatsMessage() {
+        return `📊 **Akun ${this.index} Stats**\nFarming: ${this.isFarming ? '✅ Active' : '⏹️ Stopped'}\nCaptcha: ${this.captchaDetected ? '⚠️ Detected' : '✅ Clear'}\nChannel: ${this.farmChannel ? `#${this.farmChannel.name}` : 'Not set'}\n\n📅 Daily: ${this.lastDailyTime ? new Date(this.lastDailyTime).toLocaleString() : 'Never'}`;
+    }
+
+    async start() {
+        this.setupEventHandlers();
+        
+        this.client.once('ready', () => {
+            this.log(`✅ Logged in as ${this.client.user.tag}`, 'success');
+            this.log('Type "owo hh" in any channel to start farming', 'info');
+        });
+        
+        await this.client.login(this.token).catch(err => {
+            this.log(`Login failed: ${err.message}`, 'error');
+        });
+    }
+}
+
+// ==================== MANAJEMEN MULTI TOKEN ====================
+// Baca tokens dari environment variable
+const tokens = process.env.TOKENS ? process.env.TOKENS.split(',').map(t => t.trim()) : [];
+
+if (tokens.length === 0) {
+    console.error(`${colors.red}[ERROR]${colors.reset} No tokens found in .env file!`);
+    console.log('Format TOKENS di .env: TOKENS=token1,token2,token3');
+    process.exit(1);
+}
+
+console.log(`
+${colors.bright}${colors.magenta}═══════════════════════════════════════════════════════${colors.reset}
+${colors.bright}     OwO Bot Multi-Token Auto-Farm Script Active${colors.reset}
+${colors.bright}     Total Akun: ${tokens.length}${colors.reset}
+${colors.bright}${colors.magenta}═══════════════════════════════════════════════════════${colors.reset}
+
+${colors.cyan}Informasi:${colors.reset}
+  • Script akan menjalankan ${tokens.length} akun secara bersamaan
+  • Setiap akun memiliki farming dan daily scheduler sendiri
+  • Ketik "owo hh" di channel Discord masing-masing akun untuk start
+
+${colors.yellow}⚠️  PERINGATAN:${colors.reset}
+  • Self-bot melanggar ToS Discord!
+  • Gunakan dengan risiko sendiri!
+  • Pantau terus chat untuk captcha!
+
+${colors.bright}${colors.magenta}═══════════════════════════════════════════════════════${colors.reset}
+`);
+
+// Buat instance untuk setiap token
+const botInstances = [];
+for (let i = 0; i < tokens.length; i++) {
+    const bot = new OwOBotInstance(tokens[i], i + 1);
+    botInstances.push(bot);
+    bot.start();
+}
+
+// ==================== CONSOLE COMMANDS ====================
 const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
 
-// Utility Functions
-const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
-const randomWait = (min, max) => wait(Math.random() * (max - min + 1) * 1000 + min * 1000);
-const playSoundEffect = (file) => playSound && player().play(file, (err) => err && console.error(err));
-const log = (type, msg) => {
-    const chalkTypes = {
-        success: chalk.green,
-        warning: chalk.yellow,
-        error: chalk.red,
-        info: chalk.cyan
-    };
-    const logFunction = chalkTypes[type] || chalk.white;
-    console.log(logFunction(`[${type.toUpperCase()}]: ${msg}`));
-};
-const logDivider = (label) => console.log(chalk.blueBright(`\n${"=".repeat(60)}\n= ${label}${" ".repeat(Math.max(0, 58 - label.length))}=\n${"=".repeat(60)}\n`));
+function showConsoleMenu() {
+    console.log(`
+${colors.bright}Console Commands:${colors.reset}
+  status      - Show all accounts status
+  start all   - Start farming on all accounts
+  stop all    - Stop farming on all accounts
+  daily all   - Manual daily claim on all accounts
+  help        - Show this help
+  exit        - Exit script
+`);
+}
 
-const superscriptMap = { "⁰": "0", "¹": "1", "²": "2", "³": "3", "⁴": "4", "⁵": "5", "⁶": "6", "⁷": "7", "⁸": "8", "⁹": "9" };
-const convertSuperscriptToNumber = (str) => str.split("").map((char) => superscriptMap[char] || char).join("");
-
-const restartProcess = async () => {
-    logDivider("STOPPING THE PROCESS");
-    log("warning", "Verification required. Stopping...");
-    playSoundEffect("./assets/157795.mp3");
-    await wait(2000);
-    const child = spawn(process.argv[0], process.argv.slice(1), { stdio: "inherit" });
-    child.on("close", (code) => {
-        log("error", `Process exited with code ${code}.`);
-        process.exit(code);
+async function consoleCommands() {
+    rl.question(`${colors.bright}${colors.cyan}[Console]➜${colors.reset} `, async (input) => {
+        const cmd = input.toLowerCase().trim();
+        
+        switch(cmd) {
+            case 'status':
+                console.log(`\n${colors.bright}=== STATUS SEMUA AKUN ===${colors.reset}`);
+                botInstances.forEach(bot => {
+                    console.log(`  Akun ${bot.index}: Farming: ${bot.isFarming ? '✅' : '⭕'} | Captcha: ${bot.captchaDetected ? '⚠️' : '✅'} | Channel: ${bot.farmChannel ? '✅' : '❌'}`);
+                });
+                break;
+                
+            case 'start all':
+                botInstances.forEach(bot => {
+                    if (bot.farmChannel) {
+                        bot.isFarming = true;
+                        bot.captchaDetected = false;
+                        bot.log('Farming started via console', 'success');
+                        bot.sendNextCommand();
+                    } else {
+                        bot.log('Tidak bisa start: channel belum diset (kirim "owo hh" di Discord)', 'warning');
+                    }
+                });
+                break;
+                
+            case 'stop all':
+                botInstances.forEach(bot => {
+                    bot.isFarming = false;
+                    bot.log('Farming stopped via console', 'warning');
+                });
+                break;
+                
+            case 'daily all':
+                console.log('Claiming daily for all accounts...');
+                for (const bot of botInstances) {
+                    await bot.claimDaily();
+                    await new Promise(resolve => setTimeout(resolve, 2000));
+                }
+                break;
+                
+            case 'help':
+                showConsoleMenu();
+                break;
+                
+            case 'exit':
+                console.log('Shutting down all bots...');
+                for (const bot of botInstances) {
+                    if (bot.dailyTimeout) clearTimeout(bot.dailyTimeout);
+                    bot.client.destroy();
+                }
+                process.exit(0);
+                break;
+                
+            default:
+                if (cmd) console.log(`Unknown command: ${cmd}. Type "help" for commands.`);
+        }
+        
+        consoleCommands();
     });
-    process.exit();
-};
+}
 
-rl.on("line", (input) => {
-    const command = input.trim().toLowerCase();
-    if (command === "start") {
-        spam = true;
-        log("success", "Spam started.");
-        if (!activeChannel) log("warning", "Specify a channel by typing in a Discord channel first.");
-    } else if (command === "stop") {
-        spam = false;
-        log("warning", "Stopping the spam...");
-    } else {
-        log("error", "Unknown command. Use 'start' or 'stop'.");
+showConsoleMenu();
+consoleCommands();
+
+// Handle process termination
+process.on('SIGINT', () => {
+    console.log('\nShutting down...');
+    for (const bot of botInstances) {
+        if (bot.dailyTimeout) clearTimeout(bot.dailyTimeout);
+        bot.client.destroy();
     }
+    process.exit(0);
 });
-
-client.on("ready", () => {
-    logDivider("OWOBOT FARMING SCRIPT");
-    log("success", `Logged in as ${client.user.username}`);
-    log("success", `Play Sound: ${playSound}`);
-    log("success", "Commands:\nstart   : to start the spam.\nstop   : to stop the spam. (note: it will still run the command one last time)");
-});
-
-client.on("messageCreate", async (message) => {
-    if (message.channel.type === "DM") return;
-    if (message.author.id === client.user.id) handleSelfCommands(message);
-    if (activeChannel && message.channel.id === activeChannel.id) handleOwOCommands(message);
-});
-
-const handleSelfCommands = (message) => {
-    if (message.content === "owo hh") {
-        activeChannel = message.channel;
-        spam = true;
-        log("success", "Channel set and spam started.");
-    } else if (message.content === "owo bb") {
-        spam = false;
-        log("warning", "Stopping the spam...");
-    } else if (!activeChannel) {
-        activeChannel = message.channel;
-        log("success", `Channel set to #${activeChannel.name}.`);
-    }
-};
-
-const handleOwOCommands = async (message) => {
-    const myself = message.guild.members.me?.nickname || client.user.displayName;
-    if (message.content.includes(`**====== ${myself}'s Inventory ======**`)) {
-        log("info", "Parsing inventory...");
-        parseInventory(message.content);
-    }
-    if (message.author.id === "408785106942164992") {
-        if (message.cleanContent.includes(`**🌱 | ${myself}**, hunt`)) {
-            await processHuntAndBattle(message);
-        } else if (message.components.length && message.components[0].components[0].label === "Verify") {
-            spam = false;
-            restartProcess();
-        }
-    }
-};
-
-const parseInventory = (content) => {
-    const regex = /`(\d+)`(<:|<a:)(cgem|ugem|rgem|egem|lgem|fgem)(\d+):\d+>(\W{2})/g;
-    let result;
-    while ((result = regex.exec(content)) !== null) {
-        const [id, rarityKey, typeKey, amount] = [parseInt(result[1]), result[3].charAt(0), `gem${result[4]}`, parseInt(convertSuperscriptToNumber(result[5]))];
-        gemItems.push({ id, type: gemTypeNames[typeKey] || typeKey, rarity: gemRarityNames[rarityKey] || rarityKey, amount });
-    }
-    log("success", "Inventory parsed successfully.");
-    console.table(gemItems, ["id", "type", "rarity", "amount"]);
-};
-
-const processHuntAndBattle = async (message) => {
-    logDivider("HUNT AND BATTLE");
-    if (!gemItems.length) {
-        activeChannel.sendTyping();
-        await randomWait(1, 3);
-        activeChannel.send("owo inv");
-    }
-    const gemAmounts = extractGemsLeft(message.content);
-    log("info", "Gems Remaining:");
-    console.table(gemAmounts);
-    await handleMissingGems(gemAmounts);
-    if (spam) await spamHuntAndBattle();
-};
-
-const extractGemsLeft = (content) => {
-    const gemAmounts = { "Hunting Gem": 0, "Empowering Gem": 0, "Lucky Gem": 0 };
-    const regex = /(gem1|gem3|gem4):\d+>`\[(\d+)/g;
-    let result;
-    while ((result = regex.exec(content)) !== null) {
-        gemAmounts[gemTypeNames[result[1]] || result[1]] = parseInt(result[2]);
-    }
-    return gemAmounts;
-};
-
-const sendCommandWithRandomWait = async (command) => {
-    activeChannel.sendTyping();
-    await randomWait(1, 2);
-    activeChannel.send(command);
-};
-
-const handleMissingGems = async (gemAmounts) => {
-    for (const [gemType, amount] of Object.entries(gemAmounts)) {
-        if (amount === 0) {
-            log("warning", `${gemType} has no remaining amount.`);
-            const highestIdGem = gemItems.filter((gem) => gem.type === gemType && gem.amount > 0).reduce((highest, current) => (current.id > highest.id ? current : highest), {});
-            if (highestIdGem.id) {
-                await sendCommandWithRandomWait(`owo use ${highestIdGem.id}`);
-                highestIdGem.amount -= 1;
-                log("success", `Used ${highestIdGem.rarity} ${highestIdGem.type} (ID: ${highestIdGem.id}). Remaining: ${highestIdGem.amount}`);
-            }
-        }
-    }
-};
-
-const spamHuntAndBattle = async () => {
-    logDivider("SPAMMING COMMANDS");
-    await randomWait(15, 20);
-    await sendCommandWithRandomWait("owo h");
-    await sendCommandWithRandomWait("owo b");
-    log("success", "Commands sent successfully.");
-    if (!spam) log("success", "Successfully stopped the spam.");
-};
-
-client.login(process.env.TOKEN);
